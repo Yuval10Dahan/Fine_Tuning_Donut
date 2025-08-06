@@ -4,11 +4,17 @@ from PIL import Image
 import re
 
 # === CONFIG ===
-SENSITIVE_DIR = "data\\sensitive"
-NON_SENSITIVE_DIR = "data\\non_sensitive"
+# SENSITIVE_DIR = "data\\sensitive"
+SENSITIVE_DIR = "C:\\Users\\yuval\\Desktop\\data\\sensitive"
+
+# NON_SENSITIVE_DIR = "data\\non_sensitive"
+NON_SENSITIVE_DIR = "C:\\Users\\yuval\\Desktop\\data\\non_sensitive"
+
 PII_JSON_PATH = "data\\PII_9k.json"
 PLACEHOLDER_IMAGE = "data\\white_placeholder.png"
+
 OUTPUT_JSON = "data\\annotations.json"
+OUTPUT_JSON = "C:\\Users\\yuval\\Desktop\\FinetuningJuly\\annotations.json"
 
 # === TYPE HINTS FOR IMAGES (OPTIONAL) ===
 TYPE_HINTS = {
@@ -93,14 +99,17 @@ def natural_sort_key(s):
 if __name__ == "__main__":
     print("🔍 Scanning folders and loading PII JSON...")
 
-    ensure_placeholder_image(PLACEHOLDER_IMAGE)
+    # ensure_placeholder_image(PLACEHOLDER_IMAGE)
 
     sensitive_anns = scan_images(SENSITIVE_DIR, sensitive=True)
     non_sensitive_anns = scan_images(NON_SENSITIVE_DIR, sensitive=False)
-    pii_anns = load_pii_json(PII_JSON_PATH, placeholder_image=PLACEHOLDER_IMAGE)
+    # pii_anns = load_pii_json(PII_JSON_PATH, placeholder_image=PLACEHOLDER_IMAGE)
 
-    all_anns = sensitive_anns + non_sensitive_anns + pii_anns
-    print(f"📊 Total samples: {len(all_anns)} (Sensitive: {len(sensitive_anns)+len(pii_anns)}, Non-sensitive: {len(non_sensitive_anns)})")
+    # all_anns = sensitive_anns + non_sensitive_anns + pii_anns
+    all_anns = sensitive_anns + non_sensitive_anns
+
+    # print(f"📊 Total samples: {len(all_anns)} (Sensitive: {len(sensitive_anns)+len(pii_anns)}, Non-sensitive: {len(non_sensitive_anns)})")
+    print(f"📊 Total samples: {len(all_anns)} (Sensitive: {len(sensitive_anns)}, Non-sensitive: {len(non_sensitive_anns)})")
 
     with open(OUTPUT_JSON, "w") as f:
         json.dump(all_anns, f, indent=2)

@@ -9,7 +9,8 @@ types = [
 ]
 
 # Path to the JSON file
-json_file_path = "data/annotations.json"
+# json_file_path = "data/annotations.json"
+json_file_path = "annotations.json"
 
 # Load JSON data
 with open(json_file_path, "r", encoding="utf-8") as file:
