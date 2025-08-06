@@ -11,7 +11,7 @@ from transformers import (
     default_data_collator
 )
 import torch
-
+import urllib.request
 
 # # === DOWNLOAD AND EXTRACT ZIP FROM GOOGLE DRIVE ===
 # print("=== Downloading and extracting dataset from Google Drive ===\n")
@@ -27,6 +27,13 @@ import torch
 # # Download ZIP
 # if not os.path.exists("data.zip"):
 #     gdown.download(zip_url, output="data.zip", quiet=False)
+
+
+
+zip_url = "https://www.dropbox.com/scl/fi/sviiv9yv6c05yxwrnwvoz/data.zip?rlkey=068sh3m0f1zqvnuksdfpu56qf&st=0dw5agtd&dl=1"
+
+if not os.path.exists("data.zip"):
+    urllib.request.urlretrieve(zip_url, "data.zip")
 
 # Unzip contents
 os.system("unzip -o data.zip -d ./")
