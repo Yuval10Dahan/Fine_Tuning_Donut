@@ -13,20 +13,20 @@ from transformers import (
 import torch
 
 
-# === DOWNLOAD AND EXTRACT ZIP FROM GOOGLE DRIVE ===
-print("=== Downloading and extracting dataset from Google Drive ===\n")
-try:
-    import gdown
-except ImportError:
-    os.system("pip install gdown")
-    import gdown
+# # === DOWNLOAD AND EXTRACT ZIP FROM GOOGLE DRIVE ===
+# print("=== Downloading and extracting dataset from Google Drive ===\n")
+# try:
+#     import gdown
+# except ImportError:
+#     os.system("pip install gdown")
+#     import gdown
 
-file_id = "1EkVzaYIEjLpgEjgA1q-PeDUwXAboI_1V"  
-zip_url = f"https://drive.google.com/uc?id={file_id}"
+# file_id = "1EkVzaYIEjLpgEjgA1q-PeDUwXAboI_1V"  
+# zip_url = f"https://drive.google.com/uc?id={file_id}"
 
-# Download ZIP
-if not os.path.exists("data.zip"):
-    gdown.download(zip_url, output="data.zip", quiet=False)
+# # Download ZIP
+# if not os.path.exists("data.zip"):
+#     gdown.download(zip_url, output="data.zip", quiet=False)
 
 # Unzip contents
 os.system("unzip -o data.zip -d ./")
