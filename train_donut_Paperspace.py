@@ -30,7 +30,8 @@ import urllib.request
 
 
 
-zip_url = "https://www.dropbox.com/scl/fi/sviiv9yv6c05yxwrnwvoz/data.zip?rlkey=068sh3m0f1zqvnuksdfpu56qf&st=0dw5agtd&dl=1"
+# zip_url = "https://www.dropbox.com/scl/fi/sviiv9yv6c05yxwrnwvoz/data.zip?rlkey=068sh3m0f1zqvnuksdfpu56qf&st=0dw5agtd&dl=1"
+zip_url = "https://www.dropbox.com/scl/fi/2jv4dq6yyk01r5h5ae6vl/data.zip?rlkey=wm5765mk7t8vyit9h9x26ebuq&st=fibug7a1&dl=1"
 
 if not os.path.exists("data.zip"):
     urllib.request.urlretrieve(zip_url, "data.zip")
