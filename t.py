@@ -3,7 +3,7 @@
 # No CLI flags needed — edit the CONFIG block and run:  python train_qwen_pii_classifier_cfg.py
 
 import os
-# Keep TF out of the way so it doesn't hook CUDA/cuDNN
+# Silence TensorFlow so it doesn't try to hook CUDA/cuDNN in this process
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import json, random, math, inspect, urllib.request, zipfile
@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import Dataset
 
 from transformers import TrainingArguments, Trainer
-# Prefer dedicated processor (new HF), fallback to AutoProcessor otherwise
+# Prefer the dedicated processor class; fall back to AutoProcessor if needed
 try:
     from transformers import Qwen2VLProcessor as ProcessorCls
 except Exception:
@@ -44,7 +44,6 @@ JSONL_FILENAME   = "pii_42k.jsonl"
 
 OUTDIR           = "runs/qwen_pii_12k_lora"
 
-# Training config (will be auto-dialed down on CPU)
 EPOCHS = 8
 PER_DEVICE_BATCH = 2
 ACCUM = 8                                   # global batch = PER_DEVICE_BATCH * ACCUM
@@ -58,7 +57,7 @@ EVAL_STEPS = None                           # None = auto
 
 LONG_SIDE_MAX = 896
 
-# Tiny split for smoke-test (adjust back up for real runs)
+# 12k total
 TRAIN_SENSITIVE = 4
 TRAIN_NON_SENSITIVE = 4
 VAL_SENSITIVE   = 1
@@ -364,7 +363,7 @@ def main():
         extract_zip(ZIP_LOCAL, EXTRACT_DIR)
 
     jsonl_path = resolve_jsonl_path(JSONL_FILENAME, EXTRACT_DIR)
-    dataset_root = locate_dataset_root(EXTRACT_DIR)
+    dataset_root = locate_dataset_root(EXTRACT_DIR)  # should become .../datasets/datasets/pii
 
     os.makedirs(OUTDIR, exist_ok=True)
 
@@ -376,37 +375,11 @@ def main():
     train_recs, val_recs, test_recs = make_splits(jsonl_path, dataset_root)
     print(f"Train: {len(train_recs)} | Val: {len(val_recs)} | Test: {len(test_recs)}")
 
-    # --------- Device & run mode ----------
-    has_cuda = torch.cuda.is_available()
-    is_windows = os.name == "nt"
-
-    if has_cuda:
-        device = "cuda"
-        dtype = torch.bfloat16
-        run_mode = "FULL"
-        do_eval = True
-        max_steps_override = None
-        per_device_train_batch = PER_DEVICE_BATCH
-        grad_accum = ACCUM
-        optim_name = "adamw_torch_fused"
-        num_workers = 8
-        pin_mem = True
-    else:
-        # CPU smoke-test mode: 1 optimizer step, no eval/generation
-        device = "cpu"
-        dtype = torch.float32
-        run_mode = "CPU_SMOKE_TEST"
-        do_eval = False
-        max_steps_override = 1   # do exactly one optimizer step
-        per_device_train_batch = 1
-        grad_accum = 1
-        optim_name = "adamw_torch"
-        num_workers = 0  # safer on Windows
-        pin_mem = False
-        print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).")
-        print("      For real training, run this on your A100 box.\n")
-
     print("Loading model & processor...")
+    assert torch.cuda.is_available(), "CUDA not available — run on your A100 machine."
+    device = "cuda"
+    dtype = torch.bfloat16  # A100 supports bf16 natively
+
     processor = ProcessorCls.from_pretrained(MODEL_ID, trust_remote_code=True)
     PAD_ID = getattr(processor.tokenizer, "pad_token_id", None) or processor.tokenizer.eos_token_id
 
@@ -420,7 +393,6 @@ def main():
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    # LoRA targets
     lora_targets = [
         "q_proj","k_proj","v_proj","o_proj",
         "gate_proj","up_proj","down_proj",
@@ -438,32 +410,31 @@ def main():
     val_ds   = PIIDataset(val_recs)
     collator = Collator(processor=processor, pad_token_id=PAD_ID)
 
-    steps_per_epoch = max(1, math.ceil(len(train_ds) / (per_device_train_batch * grad_accum)))
-    eval_steps = None if not do_eval else (EVAL_STEPS if EVAL_STEPS is not None else max(50, steps_per_epoch))
+    steps_per_epoch = math.ceil(len(train_ds) / (PER_DEVICE_BATCH * ACCUM))
+    eval_steps = EVAL_STEPS if EVAL_STEPS is not None else max(50, steps_per_epoch)
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
     training_args = TrainingArguments(
         output_dir=OUTDIR,
-        num_train_epochs=EPOCHS if max_steps_override is None else 1,
-        max_steps=max_steps_override,                     # 1 step on CPU; ignored on GPU
-        per_device_train_batch_size=per_device_train_batch,
-        gradient_accumulation_steps=grad_accum,
+        num_train_epochs=EPOCHS,
+        per_device_train_batch_size=PER_DEVICE_BATCH,
+        gradient_accumulation_steps=ACCUM,
         per_device_eval_batch_size=1,
-        bf16=has_cuda,                                    # bf16 only on GPU
+        bf16=True,
         learning_rate=LR_LORA,
         warmup_ratio=WARMUP_RATIO,
         weight_decay=WEIGHT_DECAY,
         logging_steps=LOGGING_STEPS,
-        eval_steps=eval_steps if do_eval else None,
+        eval_steps=eval_steps,
         save_steps=save_steps,
-        eval_strategy=("steps" if do_eval else "no"),  # skip eval on CPU
+        eval_strategy="steps",
         save_strategy="steps",
         save_total_limit=2,
         remove_unused_columns=False,
-        dataloader_num_workers=(0 if is_windows else num_workers),
-        dataloader_persistent_workers=(False if (is_windows or num_workers==0) else True),
-        dataloader_pin_memory=pin_mem,
-        optim=optim_name,
+        dataloader_num_workers=8,
+        dataloader_persistent_workers=True,
+        dataloader_pin_memory=True,
+        optim="adamw_torch_fused",
         report_to="none"
     )
 
@@ -484,8 +455,7 @@ def main():
             if self.optimizer is None:
                 extra = {}
                 sig = inspect.signature(torch.optim.AdamW)
-                # fused only on CUDA
-                if "fused" in sig.parameters and torch.cuda.is_available() and optim_name.endswith("_fused"):
+                if "fused" in sig.parameters and torch.cuda.is_available():
                     extra["fused"] = True
                 self.optimizer = torch.optim.AdamW(
                     optim_groups if optim_groups else self.model.parameters(),
@@ -500,13 +470,12 @@ def main():
         args=training_args,
         data_collator=collator,
         train_dataset=train_ds,
-        eval_dataset=(val_ds if do_eval else None),
+        eval_dataset=val_ds,
     )
 
-    print("CUDA:", torch.cuda.is_available(), "| Device:", device)
+    print("CUDA:", torch.cuda.is_available(), "| GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
     print("Dataset root:", dataset_root)
     print("JSONL path  :", jsonl_path)
-    print("Run mode    :", run_mode)
     print("Steps/epoch :", steps_per_epoch)
     print("Starting training...")
     trainer.train()
@@ -515,49 +484,45 @@ def main():
     processor.save_pretrained(OUTDIR)
 
     # ---------- Evaluation ----------
-    if has_cuda:
-        print("Evaluating on test split...")
-        model.eval()
-        test_ds = PIIDataset(test_recs)
-        y_true, y_pred = [], []
-        gen_kwargs = dict(max_new_tokens=128, do_sample=False, temperature=0.0, pad_token_id=PAD_ID)
+    print("Evaluating on test split...")
+    model.eval()
+    test_ds = PIIDataset(test_recs)
+    y_true, y_pred = [], []
+    gen_kwargs = dict(max_new_tokens=128, do_sample=False, temperature=0.0, pad_token_id=PAD_ID)
 
-        for rec in test_ds:
-            im = rec["image"]
-            im = cap_long_side(im, LONG_SIDE_MAX)
-            W, H = im.size
-            prompt = build_prompt(PII_TYPES, W, H)
+    for rec in test_ds:
+        im = rec["image"]
+        im = cap_long_side(im, LONG_SIDE_MAX)
+        W, H = im.size
+        prompt = build_prompt(PII_TYPES, W, H)
 
-            user_msgs = [{"role":"user","content":[{"type":"image"},{"type":"text","text": prompt}]}]
-            chat_text = processor.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
+        user_msgs = [{"role":"user","content":[{"type":"image"},{"type":"text","text": prompt}]}]
+        chat_text = processor.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
 
-            inputs = processor(text=[chat_text], images=[im], return_tensors="pt", padding=True)
-            inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+        inputs = processor(text=[chat_text], images=[im], return_tensors="pt", padding=True)
+        inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-            with torch.no_grad():
-                out_ids = model.generate(**inputs, **gen_kwargs)
+        with torch.no_grad():
+            out_ids = model.generate(**inputs, **gen_kwargs)
 
-            text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
-            pred = parse_json_pred(text)
+        text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+        pred = parse_json_pred(text)
 
-            _, truth_labels = normalize_labels({
-                "is_sensitive": rec["is_sensitive"],
-                "types": [k for k,v in rec["labels_dict"].items() if v]
-            })
-            y_true.append(truth_labels)
-            y_pred.append(pred)
+        _, truth_labels = normalize_labels({
+            "is_sensitive": rec["is_sensitive"],
+            "types": [k for k,v in rec["labels_dict"].items() if v]
+        })
+        y_true.append(truth_labels)
+        y_pred.append(pred)
 
-        metrics = metrics_from_preds(y_true, y_pred)
-        print("\n==== TEST METRICS ====")
-        print(f"Macro-F1 (per-class): {metrics['macro_f1']:.4f}")
-        print(f"Binary (any-PII)  ->  F1={metrics['binary']['f1']:.3f}  "
-            f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
-            f"Acc={metrics['binary']['accuracy']:.3f}")
-        for cls, m in metrics["per_class"].items():
-            print(f"{cls:>18s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  (support={m['support']})")
-    else:
-        print("\n[CPU] Skipped generation/eval to keep the smoke test fast. "
-              "Run on a GPU machine for full evaluation.\n")
+    metrics = metrics_from_preds(y_true, y_pred)
+    print("\n==== TEST METRICS ====")
+    print(f"Macro-F1 (per-class): {metrics['macro_f1']:.4f}")
+    print(f"Binary (any-PII)  ->  F1={metrics['binary']['f1']:.3f}  "
+          f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
+          f"Acc={metrics['binary']['accuracy']:.3f}")
+    for cls, m in metrics["per_class"].items():
+        print(f"{cls:>18s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  (support={m['support']})")
 
     print("\nDone.")
 
