@@ -1,0 +1,3 @@
+pip install --upgrade "transformers>=4.45.0" "accelerate>=0.34.0" \
+  "peft>=0.11.1" "qwen-vl-utils>=0.0.8" "timm>=0.9.16" \
+  "einops" "safetensors" "huggingface-hub>=0.24" "sentencepiece" "protobuf"

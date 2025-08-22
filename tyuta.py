@@ -2,7 +2,11 @@
 # Fine-tune Qwen2.5-VL-7B-Instruct (LoRA) for image-level PII classification (no boxes)
 # No CLI flags needed — edit the CONFIG block and run:  python train_qwen_pii_classifier_cfg.py
 
-import os, json, random, math, inspect, urllib.request, zipfile
+import os
+# Silence TensorFlow so it doesn't try to hook CUDA/cuDNN in this process
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+
+import json, random, math, inspect, urllib.request, zipfile
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from PIL import Image
@@ -11,7 +15,14 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
-from transformers import AutoProcessor, TrainingArguments, Trainer
+from transformers import TrainingArguments, Trainer
+# Prefer the dedicated processor class; fall back to AutoProcessor if needed
+try:
+    from transformers import Qwen2VLProcessor as ProcessorCls
+except Exception:
+    from transformers import AutoProcessor as ProcessorCls
+
+# Model class (new API first, then fallback)
 try:
     from transformers import AutoModelForImageTextToText as AutoModelCls
 except Exception:
@@ -83,7 +94,7 @@ def extract_zip(zip_path: str, extract_to: str) -> None:
 
 # ---------- Finding JSONL & dataset root ----------
 def resolve_jsonl_path(jsonl_filename: str, extract_dir: str) -> str:
-    # 1) Prefer JSONL near the script (your screenshot case)
+    # 1) Prefer JSONL near the script
     here = Path(__file__).parent.resolve()
     local = here / jsonl_filename
     if local.is_file():
@@ -137,8 +148,6 @@ def repair_image_path(original_path: str, dataset_root: str,
     """
     Remap Windows/old absolute paths to current extracted dataset.
     We look for the 'sensitive/' or 'non_sensitive/' anchor and re-root under dataset_root.
-    dataset_root must be the directory that directly contains those subfolders
-    (in your case: .../datasets/datasets/pii).
     """
     if os.path.exists(original_path):
         return original_path
@@ -221,7 +230,7 @@ class PIIDataset(Dataset):
 
 @dataclass
 class Collator:
-    processor: AutoProcessor
+    processor: ProcessorCls
     pad_token_id: int  # not used for length; we rely on attention masks
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -229,6 +238,7 @@ class Collator:
         prompts = [b["prompt"] for b in batch]
         answers = [b["answer"] for b in batch]
 
+        # Build chat messages so Qwen gets <image> placeholders automatically
         user_msgs  = [[{"role":"user","content":[{"type":"image"},{"type":"text","text": p}]}] for p in prompts]
         full_msgs  = [m + [{"role":"assistant","content":[{"type":"text","text": a}]}]
                       for m, a in zip(user_msgs, answers)]
@@ -238,24 +248,26 @@ class Collator:
         chat_full  = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
                       for m in full_msgs]
 
+        # 1) Prompt-only encoding (for mask length)
         enc_prompt = self.processor(text=chat_user, images=images, return_tensors="pt", padding=True)
         prompt_attn = enc_prompt["attention_mask"]
 
+        # 2) Full (prompt+answer) encoding
         enc_full = self.processor(text=chat_full, images=images, return_tensors="pt", padding=True)
 
         input_ids       = enc_full["input_ids"]
         attention_mask  = enc_full["attention_mask"]
         pixel_values    = enc_full["pixel_values"]
 
+        # Provide image grid tokens if available (Qwen2.5-VL uses these)
         image_grid_thw = enc_full.get("image_grid_thw", None)
         if image_grid_thw is None:
             image_grid_thw = enc_full.get("image_grid_thw_list", None)
-        if image_grid_thw is None:
+        if image_grid_thw is None:  # last resort encode images alone
             enc_img = self.processor(images=images, return_tensors="pt")
-            image_grid_thw = enc_img.get("image_grid_thw", None)
-            if image_grid_thw is None:
-                image_grid_thw = enc_img.get("image_grid_thw_list", None)
+            image_grid_thw = enc_img.get("image_grid_thw", None) or enc_img.get("image_grid_thw_list", None)
 
+        # Labels: mask prompt tokens + padding
         labels = input_ids.clone()
         for i in range(len(batch)):
             prompt_len = int(prompt_attn[i].sum().item())
@@ -366,10 +378,10 @@ def main():
     print("Loading model & processor...")
     assert torch.cuda.is_available(), "CUDA not available — run on your A100 machine."
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.bfloat16  # A100 supports bf16 natively
 
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True, use_fast=False)
-    PAD_ID = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
+    processor = ProcessorCls.from_pretrained(MODEL_ID, trust_remote_code=True)
+    PAD_ID = getattr(processor.tokenizer, "pad_token_id", None) or processor.tokenizer.eos_token_id
 
     model = AutoModelCls.from_pretrained(MODEL_ID, torch_dtype=dtype, trust_remote_code=True)
     model.to(device)
@@ -415,7 +427,7 @@ def main():
         logging_steps=LOGGING_STEPS,
         eval_steps=eval_steps,
         save_steps=save_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         save_strategy="steps",
         save_total_limit=2,
         remove_unused_columns=False,
@@ -426,6 +438,7 @@ def main():
         report_to="none"
     )
 
+    # Parameter groups (projector with different LR)
     proj_params, other_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad: continue
