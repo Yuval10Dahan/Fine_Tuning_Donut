@@ -23,12 +23,12 @@ from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_sc
 # =========================
 # CONFIG — EDIT THESE
 # =========================
-JSONL_PATH = r"C:\\Users\\yuval\\Desktop\\FinetuningJuly\\qwen\\pii_42k.jsonl"
-OUTDIR     = r"C:\\Users\\yuval\Desktop\\FinetuningJuly\\qwen\\runs\\qwen_pii_12k_lora"
+JSONL_PATH = "pii_42k.jsonl"
+OUTDIR     = "runs\\qwen_pii_12k_lora"
 
 EPOCHS = 8
 PER_DEVICE_BATCH = 2
-ACCUM = 24                        # global batch = PER_DEVICE_BATCH * ACCUM
+ACCUM = 8                      # global batch = PER_DEVICE_BATCH * ACCUM
 LR_LORA = 2e-4
 LR_PROJ = 1e-4
 WARMUP_RATIO = 0.05
@@ -41,12 +41,12 @@ EVAL_STEPS = None                 # None = auto; or set int (e.g., 500)
 LONG_SIDE_MAX = 896
 
 # (Small smoke test; bump later)
-TRAIN_SENSITIVE = 4
-TRAIN_NON_SENSITIVE = 4
-VAL_SENSITIVE   = 1
-VAL_NON_SENSITIVE = 1
-TEST_SENSITIVE  = 1
-TEST_NON_SENSITIVE = 1
+TRAIN_SENSITIVE = 4000
+TRAIN_NON_SENSITIVE = 4000
+VAL_SENSITIVE   = 1000
+VAL_NON_SENSITIVE = 1000
+TEST_SENSITIVE  = 1000
+TEST_NON_SENSITIVE = 1000
 # =========================
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -297,8 +297,9 @@ def main():
         save_strategy="steps",
         save_total_limit=2,
         remove_unused_columns=False,
-        dataloader_num_workers=0 if os.name=="nt" else 8,
-        dataloader_pin_memory=torch.cuda.is_available(),
+        dataloader_num_workers=8,
+        dataloader_persistent_workers=True,
+        dataloader_pin_memory=True,
         optim="adamw_torch_fused",
         report_to="none"
     )
@@ -338,6 +339,7 @@ def main():
         eval_dataset=val_ds,
     )
 
+    print("CUDA:", torch.cuda.is_available(), "| GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
     print("Starting training...")
     trainer.train()
 
