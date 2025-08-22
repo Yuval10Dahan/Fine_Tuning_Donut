@@ -1,0 +1,33 @@
+
+sensitive data:
+
+image number 1: sample from database of different images of credit cards that i got from the web. (visual data)
+
+image number 2 + generated_license_1.json: sample from database of similar format of generated driver licsence but with different background on each sample, and its corresponding json file, that i got from the web. (visual data)
+
+image number 3: sample from database of generated bank pin code mails that each sample is rotate differently. (visual data)
+
+image number 4: sample from database of generated medical letters that each sample is rotate differently and with different background style. (visual data)
+
+image number 5: sample from database of generated phone bills that each sample is in different style and font. (visual data)
+
+image number 6: sample of written element from a json file database with 100k elements of PII. (text data)
+
+
+Non-sensitive data:
+
+image number 7: sample from database of advertisements that i got from the web.
+
+image number 8: sample from database of budgets that i got from the web.
+
+image number 9: sample from database of emails that i got from the web.
+
+image number 10: sample from database of forms that i got from the web.
+
+image number 11: sample from database of hand written notes that i got from the web.
+
+and more images of non-sensitive data.
+
+now that you familiar with how my data (sensitive and non-sensitive) looks like, 
+give me the most suitable, better and modern model order to:
+Fine-tune Vision-Language Model (VLM) to detect sensitive data leaks in visual + textual documents.
