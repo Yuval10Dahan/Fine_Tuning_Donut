@@ -378,7 +378,6 @@ def main():
 
     # --------- Device & run mode ----------
     has_cuda = torch.cuda.is_available()
-    is_windows = os.name == "nt"
 
     if has_cuda:
         device = "cuda"
@@ -401,7 +400,7 @@ def main():
         per_device_train_batch = 1
         grad_accum = 1
         optim_name = "adamw_torch"
-        num_workers = 0  # safer on Windows
+        num_workers = 0
         pin_mem = False
         print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).")
         print("      For real training, run this on your A100 box.\n")
@@ -413,12 +412,13 @@ def main():
     model = AutoModelCls.from_pretrained(MODEL_ID, torch_dtype=dtype, trust_remote_code=True)
     model.to(device)
     model.config.use_cache = False
-    try:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    except TypeError:
-        model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    if has_cuda:
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     # LoRA targets
     lora_targets = [
@@ -439,32 +439,42 @@ def main():
     collator = Collator(processor=processor, pad_token_id=PAD_ID)
 
     steps_per_epoch = max(1, math.ceil(len(train_ds) / (per_device_train_batch * grad_accum)))
-    eval_steps = None if not do_eval else (EVAL_STEPS if EVAL_STEPS is not None else max(50, steps_per_epoch))
+    eval_steps = (EVAL_STEPS if (do_eval and EVAL_STEPS is not None) else
+                  (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
+    # ===== TrainingArguments — FIXED =====
     training_args = TrainingArguments(
         output_dir=OUTDIR,
-        num_train_epochs=EPOCHS if max_steps_override is None else 1,
-        max_steps=max_steps_override,                     # 1 step on CPU; ignored on GPU
+        num_train_epochs=float(EPOCHS),
+        # Make sure max_steps is NEVER None
+        max_steps=(max_steps_override if max_steps_override is not None else -1),
+
         per_device_train_batch_size=per_device_train_batch,
         gradient_accumulation_steps=grad_accum,
         per_device_eval_batch_size=1,
-        bf16=has_cuda,                                    # bf16 only on GPU
+
+        # Only enable bf16 on GPU
+        bf16=has_cuda,
+
         learning_rate=LR_LORA,
         warmup_ratio=WARMUP_RATIO,
         weight_decay=WEIGHT_DECAY,
+
         logging_steps=LOGGING_STEPS,
-        eval_steps=eval_steps if do_eval else None,
+        eval_steps=eval_steps,
         save_steps=save_steps,
-        eval_strategy=("steps" if do_eval else "no"),  # skip eval on CPU
+        eval_strategy=("steps" if do_eval else "no"),
         save_strategy="steps",
         save_total_limit=2,
+
         remove_unused_columns=False,
-        dataloader_num_workers=(0 if is_windows else num_workers),
-        dataloader_persistent_workers=(False if (is_windows or num_workers==0) else True),
+        dataloader_num_workers=num_workers,
+        dataloader_persistent_workers=bool(num_workers > 0),
         dataloader_pin_memory=pin_mem,
+
         optim=optim_name,
-        report_to="none"
+        report_to="none",
     )
 
     # Parameter groups (projector with different LR)
@@ -551,8 +561,8 @@ def main():
         print("\n==== TEST METRICS ====")
         print(f"Macro-F1 (per-class): {metrics['macro_f1']:.4f}")
         print(f"Binary (any-PII)  ->  F1={metrics['binary']['f1']:.3f}  "
-            f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
-            f"Acc={metrics['binary']['accuracy']:.3f}")
+              f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
+              f"Acc={metrics['binary']['accuracy']:.3f}")
         for cls, m in metrics["per_class"].items():
             print(f"{cls:>18s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  (support={m['support']})")
     else:
