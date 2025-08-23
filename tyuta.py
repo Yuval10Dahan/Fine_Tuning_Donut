@@ -530,7 +530,7 @@ def main():
         model.eval()
         test_ds = PIIDataset(test_recs)
         y_true, y_pred = [], []
-        gen_kwargs = dict(max_new_tokens=128, do_sample=False, temperature=0.0, pad_token_id=PAD_ID)
+        gen_kwargs = dict(max_new_tokens=128, do_sample=False, pad_token_id=PAD_ID)
 
         for rec in test_ds:
             im = rec["image"]
