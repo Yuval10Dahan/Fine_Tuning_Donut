@@ -521,7 +521,7 @@ def main():
     print("Starting training...")
     trainer.train()
 
-    trainer.save_model(OUTDIR)
+    trainer.save_model(OUTDIR)  
     processor.save_pretrained(OUTDIR)
 
     # ---------- Evaluation ----------
