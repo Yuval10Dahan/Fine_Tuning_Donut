@@ -88,3 +88,8 @@ pip install bitsandbytes==0.43.2
 
 # (optional) xformers that matches this torch
 pip install --index-url https://download.pytorch.org/whl/cu121 xformers
+
+
+pip install -U --no-cache-dir \
+  --index-url https://download.pytorch.org/whl/cu121 \
+  "torchvision==0.20.1"

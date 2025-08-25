@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from PIL import Image
 from pathlib import Path
-from packaging import version
 
 import torch
 from torch.utils.data import Dataset
@@ -389,8 +388,8 @@ def main():
         per_device_train_batch = PER_DEVICE_BATCH
         grad_accum = ACCUM
         optim_name = "adamw_torch_fused"
-        num_workers = 2
-        pin_mem = False
+        num_workers = 8
+        pin_mem = True
     else:
         # CPU smoke-test mode: 1 optimizer step, no eval/generation
         device = "cpu"
@@ -471,10 +470,8 @@ def main():
 
         remove_unused_columns=False,
         dataloader_num_workers=num_workers,
-        # dataloader_persistent_workers=bool(num_workers > 0),
-        dataloader_persistent_workers=False,
+        dataloader_persistent_workers=bool(num_workers > 0),
         dataloader_pin_memory=pin_mem,
-        dataloader_prefetch_factor=2,
 
         optim=optim_name,
         report_to="none",
@@ -522,7 +519,7 @@ def main():
     print("Run mode    :", run_mode)
     print("Steps/epoch :", steps_per_epoch)
     print("Starting training...")
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train()
 
     trainer.save_model(OUTDIR)
     processor.save_pretrained(OUTDIR)

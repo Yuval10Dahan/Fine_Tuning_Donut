@@ -31,6 +31,17 @@ except Exception:
 from peft import LoraConfig, get_peft_model
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 
+import torch.multiprocessing as mp
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
+
 # =========================
 # CONFIG — EDIT THESE
 # =========================
@@ -403,7 +414,7 @@ def main():
         per_device_train_batch = PER_DEVICE_BATCH
         grad_accum = ACCUM
         optim_name = "adamw_torch_fused"
-        num_workers = 2               # conservative; higher can be OK
+        num_workers = 0               # conservative; higher can be OK
         pin_mem = False               # safer with large images
     else:
         device = "cpu"
@@ -456,6 +467,14 @@ def main():
                   (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
+    dl_kwargs = dict(
+    dataloader_num_workers=num_workers,
+    dataloader_persistent_workers=False,
+    dataloader_pin_memory=pin_mem,
+    )
+    if num_workers > 0:
+        dl_kwargs["dataloader_prefetch_factor"] = 2  # only valid with workers>0
+
     # ===== TrainingArguments =====
     training_args = TrainingArguments(
         output_dir=OUTDIR,
@@ -488,6 +507,7 @@ def main():
 
         optim=optim_name,
         report_to="none",
+        **dl_kwargs,
     )
 
     # Parameter groups (projector with different LR)
