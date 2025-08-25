@@ -467,16 +467,8 @@ def main():
                   (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
-    dl_kwargs = dict(
-    dataloader_num_workers=num_workers,
-    dataloader_persistent_workers=False,
-    dataloader_pin_memory=pin_mem,
-    )
-    if num_workers > 0:
-        dl_kwargs["dataloader_prefetch_factor"] = 2  # only valid with workers>0
-
     # ===== TrainingArguments =====
-    training_args = TrainingArguments(
+    ta_kwargs = dict(
         output_dir=OUTDIR,
         num_train_epochs=float(EPOCHS),
         max_steps=(max_steps_override if max_steps_override is not None else -1),
@@ -485,7 +477,7 @@ def main():
         gradient_accumulation_steps=grad_accum,
         per_device_eval_batch_size=1,
 
-        bf16=has_cuda,  # only on GPU
+        bf16=has_cuda,  # GPU only
 
         learning_rate=LR_LORA,
         warmup_ratio=WARMUP_RATIO,
@@ -497,18 +489,23 @@ def main():
         eval_strategy=("steps" if do_eval else "no"),
         save_strategy="steps",
         save_total_limit=2,
-        save_safetensors=True,  # <— important
+        save_safetensors=True,
 
         remove_unused_columns=False,
-        dataloader_num_workers=num_workers,
-        dataloader_persistent_workers=False,  # avoids pin-memory thread issues
-        dataloader_pin_memory=pin_mem,
-        dataloader_prefetch_factor=(2 if num_workers > 0 else None),
-
         optim=optim_name,
         report_to="none",
-        **dl_kwargs,
     )
+
+    # dataloader-related args (set once)
+    ta_kwargs.update(
+        dataloader_num_workers=num_workers,
+        dataloader_persistent_workers=False,
+        dataloader_pin_memory=pin_mem,
+    )
+    if num_workers > 0:
+        ta_kwargs["dataloader_prefetch_factor"] = 2  # only valid when workers>0
+
+    training_args = TrainingArguments(**ta_kwargs)
 
     # Parameter groups (projector with different LR)
     proj_params, other_params = [], []
