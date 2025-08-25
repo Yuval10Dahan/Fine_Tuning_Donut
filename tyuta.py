@@ -1,6 +1,5 @@
 # train_qwen_pii_classifier_cfg.py
 # Fine-tune Qwen2.5-VL-7B-Instruct (LoRA) for image-level PII classification (no boxes)
-# No CLI flags needed — edit the CONFIG block and run:  python train_qwen_pii_classifier_cfg.py
 
 import os
 # Keep TF out of the way so it doesn't hook CUDA/cuDNN
@@ -14,6 +13,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
+from packaging import version
 
 from transformers import TrainingArguments, Trainer
 # Prefer dedicated processor (new HF), fallback to AutoProcessor otherwise
@@ -58,13 +58,13 @@ EVAL_STEPS = None                           # None = auto
 
 LONG_SIDE_MAX = 896
 
-# Tiny split for smoke-test (adjust back up for real runs)
-TRAIN_SENSITIVE = 4
-TRAIN_NON_SENSITIVE = 4
-VAL_SENSITIVE   = 1
-VAL_NON_SENSITIVE = 1
-TEST_SENSITIVE  = 1
-TEST_NON_SENSITIVE = 1
+# Dataset sizes (adjust to your needs)
+TRAIN_SENSITIVE = 4000
+TRAIN_NON_SENSITIVE = 4000
+VAL_SENSITIVE   = 1000
+VAL_NON_SENSITIVE = 1000
+TEST_SENSITIVE  = 1000
+TEST_NON_SENSITIVE = 1000
 # =========================
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -357,6 +357,21 @@ def metrics_from_preds(y_true: List[Dict[str,bool]], y_pred: List[Dict[str,bool]
     }
     return {"per_class": per, "macro_f1": macro_f1, "binary": bin_metrics}
 
+# ---------- Helpers ----------
+def _latest_ckpt_dir(outdir: str) -> Optional[str]:
+    p = Path(outdir)
+    if not p.exists(): return None
+    cks = [d for d in p.glob("checkpoint-*") if d.is_dir()]
+    if not cks: return None
+    return str(max(cks, key=lambda d: d.stat().st_mtime))
+
+def _strip_state_files_for_torch_lt_26(ckpt_dir: str):
+    """Remove files that would require torch.load() when resuming on torch<2.6."""
+    for fname in ("optimizer.pt", "scheduler.pt", "rng_state.pth", "scaler.pt"):
+        f = os.path.join(ckpt_dir, fname)
+        if os.path.exists(f):
+            os.remove(f)
+
 # ---------- Main ----------
 def main():
     if USE_DROPBOX:
@@ -388,22 +403,20 @@ def main():
         per_device_train_batch = PER_DEVICE_BATCH
         grad_accum = ACCUM
         optim_name = "adamw_torch_fused"
-        num_workers = 8
-        pin_mem = True
+        num_workers = 2               # conservative; higher can be OK
+        pin_mem = False               # safer with large images
     else:
-        # CPU smoke-test mode: 1 optimizer step, no eval/generation
         device = "cpu"
         dtype = torch.float32
         run_mode = "CPU_SMOKE_TEST"
         do_eval = False
-        max_steps_override = 1   # do exactly one optimizer step
+        max_steps_override = 1
         per_device_train_batch = 1
         grad_accum = 1
         optim_name = "adamw_torch"
         num_workers = 0
         pin_mem = False
-        print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).")
-        print("      For real training, run this on your A100 box.\n")
+        print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).\n")
 
     print("Loading model & processor...")
     processor = ProcessorCls.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -443,19 +456,17 @@ def main():
                   (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
-    # ===== TrainingArguments — FIXED =====
+    # ===== TrainingArguments =====
     training_args = TrainingArguments(
         output_dir=OUTDIR,
         num_train_epochs=float(EPOCHS),
-        # Make sure max_steps is NEVER None
         max_steps=(max_steps_override if max_steps_override is not None else -1),
 
         per_device_train_batch_size=per_device_train_batch,
         gradient_accumulation_steps=grad_accum,
         per_device_eval_batch_size=1,
 
-        # Only enable bf16 on GPU
-        bf16=has_cuda,
+        bf16=has_cuda,  # only on GPU
 
         learning_rate=LR_LORA,
         warmup_ratio=WARMUP_RATIO,
@@ -467,11 +478,13 @@ def main():
         eval_strategy=("steps" if do_eval else "no"),
         save_strategy="steps",
         save_total_limit=2,
+        save_safetensors=True,  # <— important
 
         remove_unused_columns=False,
         dataloader_num_workers=num_workers,
-        dataloader_persistent_workers=bool(num_workers > 0),
+        dataloader_persistent_workers=False,  # avoids pin-memory thread issues
         dataloader_pin_memory=pin_mem,
+        dataloader_prefetch_factor=(2 if num_workers > 0 else None),
 
         optim=optim_name,
         report_to="none",
@@ -494,8 +507,7 @@ def main():
             if self.optimizer is None:
                 extra = {}
                 sig = inspect.signature(torch.optim.AdamW)
-                # fused only on CUDA
-                if "fused" in sig.parameters and torch.cuda.is_available() and optim_name.endswith("_fused"):
+                if "fused" in sig.parameters and torch.cuda.is_available() and "fused" in optim_name:
                     extra["fused"] = True
                 self.optimizer = torch.optim.AdamW(
                     optim_groups if optim_groups else self.model.parameters(),
@@ -518,10 +530,22 @@ def main():
     print("JSONL path  :", jsonl_path)
     print("Run mode    :", run_mode)
     print("Steps/epoch :", steps_per_epoch)
-    print("Starting training...")
-    trainer.train()
 
-    trainer.save_model(OUTDIR)  
+    # --------- Safe resume logic ----------
+    print("Starting training...")
+    latest = _latest_ckpt_dir(OUTDIR)
+    if latest:
+        if version.parse(torch.__version__) < version.parse("2.6.0"):
+            _strip_state_files_for_torch_lt_26(latest)
+            print(f"[Resume] torch {torch.__version__} < 2.6 — resuming from {latest} WITHOUT "
+                  f"optimizer/scheduler/RNG state.")
+        else:
+            print(f"[Resume] Resuming from {latest} with full state.")
+        trainer.train(resume_from_checkpoint=latest)
+    else:
+        trainer.train()
+
+    trainer.save_model(OUTDIR)
     processor.save_pretrained(OUTDIR)
 
     # ---------- Evaluation ----------
