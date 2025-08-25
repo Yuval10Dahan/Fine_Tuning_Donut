@@ -81,4 +81,4 @@ env -u LD_LIBRARY_PATH \
   TRANSFORMERS_NO_TF=1 \
   TF_CPP_MIN_LOG_LEVEL=3 \
   HF_HUB_ENABLE_HF_TRANSFER=1 \
-  python tyuta.py
+  python train_qwen.py
