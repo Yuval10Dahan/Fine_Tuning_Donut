@@ -1,9 +1,8 @@
 # train_qwen_pii_classifier_cfg.py
 # Fine-tune Qwen2.5-VL-7B-Instruct (LoRA) for image-level PII classification (no boxes)
-# No CLI flags needed — edit the CONFIG block and run:  python train_qwen_pii_classifier_cfg.py
 
 import os
-# Silence TensorFlow so it doesn't try to hook CUDA/cuDNN in this process
+# Keep TF out of the way so it doesn't hook CUDA/cuDNN
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 import json, random, math, inspect, urllib.request, zipfile
@@ -14,9 +13,10 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
+from packaging import version
 
 from transformers import TrainingArguments, Trainer
-# Prefer the dedicated processor class; fall back to AutoProcessor if needed
+# Prefer dedicated processor (new HF), fallback to AutoProcessor otherwise
 try:
     from transformers import Qwen2VLProcessor as ProcessorCls
 except Exception:
@@ -31,6 +31,43 @@ except Exception:
 from peft import LoraConfig, get_peft_model
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
 
+import torch.multiprocessing as mp
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
+
+
+# ========= Debug label parser (for inspection) =========
+LABELS = {"CREDIT_CARD_NUMBER","SSN","DRIVER_LICENSE","PERSONAL_ID","PIN_CODE",
+          "MEDICAL_LETTER","PHONE_BILL","NAME","ADDRESS","PHONE","OTHER_PII",
+          "BANK_ACCOUNT_NUMBER","NONE"}
+
+def extract_labels(text: str):
+    import json, re
+    t = (text or "").strip().upper()
+    # JSON-friendly path
+    try:
+        j = json.loads(t)
+        if isinstance(j, dict):
+            if "label" in j:
+                v = str(j["label"]).upper().replace(" ", "_")
+                return [v] if v in LABELS else ["NONE"]
+            if "labels" in j:
+                vals = {str(x).upper().replace(" ", "_") for x in j["labels"]}
+                return list(vals & LABELS) or ["NONE"]
+    except Exception:
+        pass
+    # Plain-text fallback
+    m = re.search(r"\b(" + "|".join(map(re.escape, LABELS)) + r")\b", t)
+    return [m.group(1)] if m else ["NONE"]
+
+
 # =========================
 # CONFIG — EDIT THESE
 # =========================
@@ -44,6 +81,7 @@ JSONL_FILENAME   = "pii_42k.jsonl"
 
 OUTDIR           = "runs/qwen_pii_12k_lora"
 
+# Training config (will be auto-dialed down on CPU)
 EPOCHS = 8
 PER_DEVICE_BATCH = 2
 ACCUM = 8                                   # global batch = PER_DEVICE_BATCH * ACCUM
@@ -57,13 +95,13 @@ EVAL_STEPS = None                           # None = auto
 
 LONG_SIDE_MAX = 896
 
-# 12k total
-TRAIN_SENSITIVE = 4
-TRAIN_NON_SENSITIVE = 4
-VAL_SENSITIVE   = 1
-VAL_NON_SENSITIVE = 1
-TEST_SENSITIVE  = 1
-TEST_NON_SENSITIVE = 1
+# Dataset sizes (adjust to your needs)
+TRAIN_SENSITIVE = 4000
+TRAIN_NON_SENSITIVE = 4000
+VAL_SENSITIVE   = 1000
+VAL_NON_SENSITIVE = 1000
+TEST_SENSITIVE  = 1000
+TEST_NON_SENSITIVE = 1000
 # =========================
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -356,6 +394,21 @@ def metrics_from_preds(y_true: List[Dict[str,bool]], y_pred: List[Dict[str,bool]
     }
     return {"per_class": per, "macro_f1": macro_f1, "binary": bin_metrics}
 
+# ---------- Helpers ----------
+def _latest_ckpt_dir(outdir: str) -> Optional[str]:
+    p = Path(outdir)
+    if not p.exists(): return None
+    cks = [d for d in p.glob("checkpoint-*") if d.is_dir()]
+    if not cks: return None
+    return str(max(cks, key=lambda d: d.stat().st_mtime))
+
+def _strip_state_files_for_torch_lt_26(ckpt_dir: str):
+    """Remove files that would require torch.load() when resuming on torch<2.6."""
+    for fname in ("optimizer.pt", "scheduler.pt", "rng_state.pth", "scaler.pt"):
+        f = os.path.join(ckpt_dir, fname)
+        if os.path.exists(f):
+            os.remove(f)
+
 # ---------- Main ----------
 def main():
     if USE_DROPBOX:
@@ -363,7 +416,7 @@ def main():
         extract_zip(ZIP_LOCAL, EXTRACT_DIR)
 
     jsonl_path = resolve_jsonl_path(JSONL_FILENAME, EXTRACT_DIR)
-    dataset_root = locate_dataset_root(EXTRACT_DIR)  # should become .../datasets/datasets/pii
+    dataset_root = locate_dataset_root(EXTRACT_DIR)
 
     os.makedirs(OUTDIR, exist_ok=True)
 
@@ -375,24 +428,49 @@ def main():
     train_recs, val_recs, test_recs = make_splits(jsonl_path, dataset_root)
     print(f"Train: {len(train_recs)} | Val: {len(val_recs)} | Test: {len(test_recs)}")
 
-    print("Loading model & processor...")
-    assert torch.cuda.is_available(), "CUDA not available — run on your A100 machine."
-    device = "cuda"
-    dtype = torch.bfloat16  # A100 supports bf16 natively
+    # --------- Device & run mode ----------
+    has_cuda = torch.cuda.is_available()
 
+    if has_cuda:
+        device = "cuda"
+        dtype = torch.bfloat16
+        run_mode = "FULL"
+        do_eval = True
+        max_steps_override = None
+        per_device_train_batch = PER_DEVICE_BATCH
+        grad_accum = ACCUM
+        optim_name = "adamw_torch_fused"
+        num_workers = 0               # conservative; higher can be OK
+        pin_mem = False               # safer with large images
+    else:
+        device = "cpu"
+        dtype = torch.float32
+        run_mode = "CPU_SMOKE_TEST"
+        do_eval = False
+        max_steps_override = 1
+        per_device_train_batch = 1
+        grad_accum = 1
+        optim_name = "adamw_torch"
+        num_workers = 0
+        pin_mem = False
+        print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).\n")
+
+    print("Loading model & processor...")
     processor = ProcessorCls.from_pretrained(MODEL_ID, trust_remote_code=True)
     PAD_ID = getattr(processor.tokenizer, "pad_token_id", None) or processor.tokenizer.eos_token_id
 
     model = AutoModelCls.from_pretrained(MODEL_ID, torch_dtype=dtype, trust_remote_code=True)
     model.to(device)
     model.config.use_cache = False
-    try:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    except TypeError:
-        model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    if has_cuda:
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
+    # LoRA targets
     lora_targets = [
         "q_proj","k_proj","v_proj","o_proj",
         "gate_proj","up_proj","down_proj",
@@ -410,33 +488,50 @@ def main():
     val_ds   = PIIDataset(val_recs)
     collator = Collator(processor=processor, pad_token_id=PAD_ID)
 
-    steps_per_epoch = math.ceil(len(train_ds) / (PER_DEVICE_BATCH * ACCUM))
-    eval_steps = EVAL_STEPS if EVAL_STEPS is not None else max(50, steps_per_epoch)
+    steps_per_epoch = max(1, math.ceil(len(train_ds) / (per_device_train_batch * grad_accum)))
+    eval_steps = (EVAL_STEPS if (do_eval and EVAL_STEPS is not None) else
+                  (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
-    training_args = TrainingArguments(
+    # ===== TrainingArguments =====
+    ta_kwargs = dict(
         output_dir=OUTDIR,
-        num_train_epochs=EPOCHS,
-        per_device_train_batch_size=PER_DEVICE_BATCH,
-        gradient_accumulation_steps=ACCUM,
+        num_train_epochs=float(EPOCHS),
+        max_steps=(max_steps_override if max_steps_override is not None else -1),
+
+        per_device_train_batch_size=per_device_train_batch,
+        gradient_accumulation_steps=grad_accum,
         per_device_eval_batch_size=1,
-        bf16=True,
+
+        bf16=has_cuda,  # GPU only
+
         learning_rate=LR_LORA,
         warmup_ratio=WARMUP_RATIO,
         weight_decay=WEIGHT_DECAY,
+
         logging_steps=LOGGING_STEPS,
         eval_steps=eval_steps,
         save_steps=save_steps,
-        eval_strategy="steps",
+        eval_strategy=("steps" if do_eval else "no"),
         save_strategy="steps",
         save_total_limit=2,
+        save_safetensors=True,
+
         remove_unused_columns=False,
-        dataloader_num_workers=8,
-        dataloader_persistent_workers=True,
-        dataloader_pin_memory=True,
-        optim="adamw_torch_fused",
-        report_to="none"
+        optim=optim_name,
+        report_to="none",
     )
+
+    # dataloader-related args (set once)
+    ta_kwargs.update(
+        dataloader_num_workers=num_workers,
+        dataloader_persistent_workers=False,
+        dataloader_pin_memory=pin_mem,
+    )
+    if num_workers > 0:
+        ta_kwargs["dataloader_prefetch_factor"] = 2  # only valid when workers>0
+
+    training_args = TrainingArguments(**ta_kwargs)
 
     # Parameter groups (projector with different LR)
     proj_params, other_params = [], []
@@ -455,7 +550,7 @@ def main():
             if self.optimizer is None:
                 extra = {}
                 sig = inspect.signature(torch.optim.AdamW)
-                if "fused" in sig.parameters and torch.cuda.is_available():
+                if "fused" in sig.parameters and torch.cuda.is_available() and "fused" in optim_name:
                     extra["fused"] = True
                 self.optimizer = torch.optim.AdamW(
                     optim_groups if optim_groups else self.model.parameters(),
@@ -470,59 +565,96 @@ def main():
         args=training_args,
         data_collator=collator,
         train_dataset=train_ds,
-        eval_dataset=val_ds,
+        eval_dataset=(val_ds if do_eval else None),
     )
 
-    print("CUDA:", torch.cuda.is_available(), "| GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+    print("CUDA:", torch.cuda.is_available(), "| Device:", device)
     print("Dataset root:", dataset_root)
     print("JSONL path  :", jsonl_path)
+    print("Run mode    :", run_mode)
     print("Steps/epoch :", steps_per_epoch)
+
+    # --------- Safe resume logic ----------
     print("Starting training...")
-    trainer.train()
+    latest = _latest_ckpt_dir(OUTDIR)
+    if latest:
+        if version.parse(torch.__version__) < version.parse("2.6.0"):
+            _strip_state_files_for_torch_lt_26(latest)
+            print(f"[Resume] torch {torch.__version__} < 2.6 — resuming from {latest} WITHOUT "
+                  f"optimizer/scheduler/RNG state.")
+        else:
+            print(f"[Resume] Resuming from {latest} with full state.")
+        trainer.train(resume_from_checkpoint=latest)
+    else:
+        trainer.train()
 
     trainer.save_model(OUTDIR)
     processor.save_pretrained(OUTDIR)
 
     # ---------- Evaluation ----------
-    print("Evaluating on test split...")
-    model.eval()
-    test_ds = PIIDataset(test_recs)
-    y_true, y_pred = [], []
-    gen_kwargs = dict(max_new_tokens=128, do_sample=False, temperature=0.0, pad_token_id=PAD_ID)
+    if has_cuda:
+        print("Evaluating on test split...")
+        print("PEFT active?",
+              any("lora" in n.lower() and p.requires_grad for n,p in model.named_parameters()))
+        model.eval()
 
-    for rec in test_ds:
-        im = rec["image"]
-        im = cap_long_side(im, LONG_SIDE_MAX)
-        W, H = im.size
-        prompt = build_prompt(PII_TYPES, W, H)
+        test_ds = PIIDataset(test_recs)
+        y_true, y_pred = [], []
 
-        user_msgs = [{"role":"user","content":[{"type":"image"},{"type":"text","text": prompt}]}]
-        chat_text = processor.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
+        # Clean gen kwargs (no temperature warning)
+        gen_kwargs = dict(
+            max_new_tokens=128,
+            do_sample=False,
+            pad_token_id=PAD_ID,
+            eos_token_id=processor.tokenizer.eos_token_id
+        )
 
-        inputs = processor(text=[chat_text], images=[im], return_tensors="pt", padding=True)
-        inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+        # === DEBUG: print first 10 raw generations ===
+        printed = 0
 
-        with torch.no_grad():
-            out_ids = model.generate(**inputs, **gen_kwargs)
+        for rec in test_ds:
+            im = rec["image"]
+            im = cap_long_side(im, LONG_SIDE_MAX)
+            W, H = im.size
+            prompt = build_prompt(PII_TYPES, W, H)
 
-        text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
-        pred = parse_json_pred(text)
+            user_msgs = [{"role":"user","content":[{"type":"image"},{"type":"text","text": prompt}]}]
+            chat_text = processor.apply_chat_template(user_msgs, tokenize=False, add_generation_prompt=True)
 
-        _, truth_labels = normalize_labels({
-            "is_sensitive": rec["is_sensitive"],
-            "types": [k for k,v in rec["labels_dict"].items() if v]
-        })
-        y_true.append(truth_labels)
-        y_pred.append(pred)
+            inputs = processor(text=[chat_text], images=[im], return_tensors="pt", padding=True)
+            inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-    metrics = metrics_from_preds(y_true, y_pred)
-    print("\n==== TEST METRICS ====")
-    print(f"Macro-F1 (per-class): {metrics['macro_f1']:.4f}")
-    print(f"Binary (any-PII)  ->  F1={metrics['binary']['f1']:.3f}  "
-          f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
-          f"Acc={metrics['binary']['accuracy']:.3f}")
-    for cls, m in metrics["per_class"].items():
-        print(f"{cls:>18s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  (support={m['support']})")
+            with torch.no_grad():
+                out_ids = model.generate(**inputs, **gen_kwargs)
+
+            text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+            pred = parse_json_pred(text)
+
+            _, truth_labels = normalize_labels({
+                "is_sensitive": rec["is_sensitive"],
+                "types": [k for k,v in rec["labels_dict"].items() if v]
+            })
+            y_true.append(truth_labels)
+            y_pred.append(pred)
+
+            if printed < 10:
+                parsed_dbg = extract_labels(text)
+                print(f"[{printed}] RAW='{text}'")
+                print(f"     PARSED_DEBUG={parsed_dbg}")
+                print(f"     GT_POS={sorted([k for k,v in truth_labels.items() if v])}")
+                printed += 1
+
+        metrics = metrics_from_preds(y_true, y_pred)
+        print("\n==== TEST METRICS ====")
+        print(f"Macro-F1 (per-class): {metrics['macro_f1']:.4f}")
+        print(f"Binary (any-PII)  ->  F1={metrics['binary']['f1']:.3f}  "
+              f"P={metrics['binary']['precision']:.3f}  R={metrics['binary']['recall']:.3f}  "
+              f"Acc={metrics['binary']['accuracy']:.3f}")
+        for cls, m in metrics["per_class"].items():
+            print(f"{cls:>18s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  (support={m['support']})")
+    else:
+        print("\n[CPU] Skipped generation/eval to keep the smoke test fast. "
+              "Run on a GPU machine for full evaluation.\n")
 
     print("\nDone.")
 
