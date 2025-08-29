@@ -1,11 +1,26 @@
 # train_qwen_pii_classifier_cfg.py
 # Fine-tune Qwen2.5-VL-7B-Instruct (LoRA) for image-level PII classification (no boxes)
+# - Training mode (default): wraps base model with LoRA and trains
+# - Eval-only mode: loads ONLY the trained LoRA adapters and evaluates (no re-training, no double-wrap)
+#
+# Examples:
+#   # Full training (as before)
+#   env -u LD_LIBRARY_PATH TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3 HF_HUB_ENABLE_HF_TRANSFER=1 \
+#       python train_qwen_pii_classifier_cfg.py
+#
+#   # Eval only (no training) with concise logs
+#   env -u LD_LIBRARY_PATH TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3 HF_HUB_ENABLE_HF_TRANSFER=1 \
+#       EVAL_ONLY=1 DEBUG_EVAL=0 python train_qwen_pii_classifier_cfg.py
+#
+#   # Eval only with per-sample debug prints (first N samples if EVAL_LIMIT is set)
+#   env -u LD_LIBRARY_PATH TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3 HF_HUB_ENABLE_HF_TRANSFER=1 \
+#       EVAL_ONLY=1 DEBUG_EVAL=1 EVAL_LIMIT=25 python train_qwen_pii_classifier_cfg.py
 
 import os
 # Keep TF out of the way so it doesn't hook CUDA/cuDNN
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
-import json, random, math, inspect, urllib.request, zipfile
+import json, random, math, inspect, urllib.request, zipfile, re
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from PIL import Image
@@ -15,7 +30,7 @@ import torch
 from torch.utils.data import Dataset
 from packaging import version
 
-from transformers import TrainingArguments, Trainer, GenerationConfig
+from transformers import TrainingArguments, Trainer
 # Prefer dedicated processor (new HF), fallback to AutoProcessor otherwise
 try:
     from transformers import Qwen2VLProcessor as ProcessorCls
@@ -41,36 +56,6 @@ try:
     torch.multiprocessing.set_sharing_strategy("file_system")
 except RuntimeError:
     pass
-
-
-# =========================
-# LABELSETS / CLASSES
-# =========================
-LABELS = {
-    "CREDIT_CARD_NUMBER","SSN","DRIVER_LICENSE","PERSONAL_ID","PIN_CODE",
-    "MEDICAL_LETTER","PHONE_BILL","NAME","ADDRESS","PHONE","OTHER_PII",
-    "BANK_ACCOUNT_NUMBER","NONE"
-}
-
-def extract_labels(text: str):
-    """Not used in eval anymore; kept for completeness."""
-    import json, re
-    t = (text or "").strip().upper()
-    # JSON-friendly path
-    try:
-        j = json.loads(t)
-        if isinstance(j, dict):
-            if "label" in j:
-                v = str(j["label"]).upper().replace(" ", "_")
-                return [v] if v in LABELS else ["NONE"]
-            if "labels" in j:
-                vals = {str(x).upper().replace(" ", "_") for x in j["labels"]}
-                return list(vals & LABELS) or ["NONE"]
-    except Exception:
-        pass
-    # Plain-text fallback
-    m = re.search(r"\b(" + "|".join(map(re.escape, LABELS)) + r")\b", t)
-    return [m.group(1)] if m else ["NONE"]
 
 
 # =========================
@@ -111,6 +96,12 @@ TEST_NON_SENSITIVE = 1000
 
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 SEED = 42
+
+# ---- Runtime toggles via env vars ----
+EVAL_ONLY  = bool(int(os.getenv("EVAL_ONLY", "0")))     # 1 = skip training, load adapters, evaluate
+DEBUG_EVAL = bool(int(os.getenv("DEBUG_EVAL", "0")))    # 1 = print per-sample prediction/GT
+EVAL_LIMIT = int(os.getenv("EVAL_LIMIT", "0"))          # >0 = evaluate only first N samples for quick checks
+
 
 PII_TYPES = [
     "CREDIT_CARD_NUMBER","SSN","DRIVER_LICENSE","PERSONAL_ID",
@@ -366,15 +357,20 @@ def make_splits(jsonl_path: str, dataset_root: str):
     random.shuffle(train); random.shuffle(val); random.shuffle(test)
     return train, val, test
 
+def _strip_code_fence(s: str) -> str:
+    # Remove ```json ... ``` or ``` ... ``` fences if present
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
 def parse_json_pred(s: str) -> Dict[str, bool]:
-    """
-    Robustly extract the last JSON object and read the "labels" map.
-    Returns all-False if parsing fails.
-    """
     try:
-        l = s.find("{"); r = s.rfind("}")
+        raw = _strip_code_fence(s)
+        l = raw.find("{"); r = raw.rfind("}")
         if l != -1 and r != -1 and r > l:
-            obj = json.loads(s[l:r+1])
+            obj = json.loads(raw[l:r+1])
             lbls = obj.get("labels", {})
             return {k: bool(lbls.get(k, False)) for k in PII_TYPES}
     except Exception:
@@ -386,7 +382,8 @@ def metrics_from_preds(y_true: List[Dict[str,bool]], y_pred: List[Dict[str,bool]
     for cls in PII_TYPES:
         t = [int(x.get(cls, False)) for x in y_true]
         p = [int(x.get(cls, False)) for x in y_pred]
-        if sum(t) == 0 and sum(p) == 0: continue
+        if sum(t) == 0 and sum(p) == 0:  # skip classes with no positives anywhere
+            continue
         per[cls] = {
             "f1": f1_score(t, p, zero_division=0),
             "precision": precision_score(t, p, zero_division=0),
@@ -419,26 +416,8 @@ def _strip_state_files_for_torch_lt_26(ckpt_dir: str):
         if os.path.exists(f):
             os.remove(f)
 
-def _load_adapters_if_any(model, outdir: str) -> None:
-    """
-    Load PEFT adapters from the newest checkpoint if present, else from OUTDIR root.
-    """
-    latest = _latest_ckpt_dir(outdir)
-    target = latest if latest else outdir
-    if Path(target).exists():
-        try:
-            model = PeftModel.from_pretrained(model, target)
-            print(f"[PEFT] Loaded adapters from: {target}")
-            return model
-        except Exception as e:
-            print(f"[PEFT][WARN] Could not load adapters from {target}: {e}")
-    return model
 
-# ---------- Main ----------
 def main():
-    EVAL_ONLY = str(os.getenv("EVAL_ONLY", "0")).lower() in ("1","true","yes")
-    DEBUG_EVAL = str(os.getenv("DEBUG_EVAL", "0")).lower() in ("1","true","yes")
-
     if USE_DROPBOX:
         download_if_needed(DROPBOX_ZIP_URL, ZIP_LOCAL)
         extract_zip(ZIP_LOCAL, EXTRACT_DIR)
@@ -474,58 +453,58 @@ def main():
         device = "cpu"
         dtype = torch.float32
         run_mode = "CPU_SMOKE_TEST"
-        do_eval = False
+        do_eval = False if not EVAL_ONLY else True  # allow CPU eval in eval-only if desired
         max_steps_override = 1
         per_device_train_batch = 1
         grad_accum = 1
         optim_name = "adamw_torch"
         num_workers = 0
         pin_mem = False
-        print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).\n")
+        if not EVAL_ONLY:
+            print("\n[CPU] CUDA not available — running a quick CPU smoke test (1 train step, no eval).\n")
 
     print("Loading model & processor...")
     processor = ProcessorCls.from_pretrained(MODEL_ID, trust_remote_code=True)
     PAD_ID = getattr(processor.tokenizer, "pad_token_id", None) or processor.tokenizer.eos_token_id
 
-    # Load base model
     model = AutoModelCls.from_pretrained(MODEL_ID, torch_dtype=dtype, trust_remote_code=True)
     model.to(device)
     model.config.use_cache = False
 
-    # Remove 'temperature' from generation config to avoid warnings on generate()
-    try:
-        gc = model.generation_config.to_dict()
-        if "temperature" in gc:
-            gc.pop("temperature", None)
-            model.generation_config = GenerationConfig.from_dict(gc)
-    except Exception:
-        pass
+    # ----- LoRA attach/load (NO double-wrap) -----
+    if EVAL_ONLY:
+        latest = _latest_ckpt_dir(OUTDIR)
+        if latest:
+            # Wrap base with the trained adapters (inference, not trainable)
+            model = PeftModel.from_pretrained(model, latest, is_trainable=False)
+            print(f"[Eval-Only] Loaded adapters from {latest}")
+        else:
+            print("[Eval-Only][WARN] No checkpoint found in OUTDIR; evaluating base model only.")
+        model.eval()
+        torch.set_grad_enabled(False)
+    else:
+        if has_cuda:
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+        # LoRA targets
+        lora_targets = [
+            "q_proj","k_proj","v_proj","o_proj",
+            "gate_proj","up_proj","down_proj",
+            "wo","wq","wk","wv",
+            "multi_modal_projector","mm_projector","vision_proj"
+        ]
+        peft_config = LoraConfig(
+            r=32, lora_alpha=32, lora_dropout=0.05,
+            target_modules=lora_targets, bias="none", task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
 
-    if has_cuda:
-        try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-
-    # Prepare LoRA
-    lora_targets = [
-        "q_proj","k_proj","v_proj","o_proj",
-        "gate_proj","up_proj","down_proj",
-        "wo","wq","wk","wv",
-        "multi_modal_projector","mm_projector","vision_proj"
-    ]
-    peft_config = LoraConfig(
-        r=32, lora_alpha=32, lora_dropout=0.05,
-        target_modules=lora_targets, bias="none", task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
-
-    # Try to load already-trained adapters before doing anything else
-    model = _load_adapters_if_any(model, OUTDIR)
-
+    # ----- Datasets / collator -----
     train_ds = PIIDataset(train_recs)
     val_ds   = PIIDataset(val_recs)
     collator = Collator(processor=processor, pad_token_id=PAD_ID)
@@ -535,99 +514,91 @@ def main():
                   (max(50, steps_per_epoch) if do_eval else None))
     save_steps = SAVE_STEPS if SAVE_STEPS is not None else max(100, steps_per_epoch)
 
-    # ===== TrainingArguments =====
-    ta_kwargs = dict(
-        output_dir=OUTDIR,
-        num_train_epochs=float(EPOCHS),
-        max_steps=(max_steps_override if max_steps_override is not None else -1),
+    # ===== Training (skipped when EVAL_ONLY=1) =====
+    if not EVAL_ONLY:
+        ta_kwargs = dict(
+            output_dir=OUTDIR,
+            num_train_epochs=float(EPOCHS),
+            max_steps=(max_steps_override if max_steps_override is not None else -1),
 
-        per_device_train_batch_size=per_device_train_batch,
-        gradient_accumulation_steps=grad_accum,
-        per_device_eval_batch_size=1,
+            per_device_train_batch_size=per_device_train_batch,
+            gradient_accumulation_steps=grad_accum,
+            per_device_eval_batch_size=1,
 
-        bf16=has_cuda,  # GPU only
+            bf16=has_cuda,  # GPU only
 
-        learning_rate=LR_LORA,
-        warmup_ratio=WARMUP_RATIO,
-        weight_decay=WEIGHT_DECAY,
+            learning_rate=LR_LORA,
+            warmup_ratio=WARMUP_RATIO,
+            weight_decay=WEIGHT_DECAY,
 
-        logging_steps=LOGGING_STEPS,
-        eval_steps=eval_steps,
-        save_steps=save_steps,
-        eval_strategy=("steps" if do_eval else "no"),
-        save_strategy="steps",
-        save_total_limit=2,
-        save_safetensors=True,
+            logging_steps=LOGGING_STEPS,
+            eval_steps=eval_steps,
+            save_steps=save_steps,
+            eval_strategy=("steps" if do_eval else "no"),
+            save_strategy="steps",
+            save_total_limit=2,
+            save_safetensors=True,
 
-        remove_unused_columns=False,
-        optim=optim_name,
-        report_to="none",
-    )
+            remove_unused_columns=False,
+            optim=optim_name,
+            report_to="none",
+        )
 
-    # dataloader-related args (set once)
-    ta_kwargs.update(
-        dataloader_num_workers=num_workers,
-        dataloader_persistent_workers=False,
-        dataloader_pin_memory=pin_mem,
-    )
-    if num_workers > 0:
-        ta_kwargs["dataloader_prefetch_factor"] = 2  # only valid when workers>0
+        # dataloader-related args (set once)
+        ta_kwargs.update(
+            dataloader_num_workers=num_workers,
+            dataloader_persistent_workers=False,
+            dataloader_pin_memory=pin_mem,
+        )
+        if num_workers > 0:
+            ta_kwargs["dataloader_prefetch_factor"] = 2  # only valid when workers>0
 
-    training_args = TrainingArguments(**ta_kwargs)
+        training_args = TrainingArguments(**ta_kwargs)
 
-    # Parameter groups (projector with different LR)
-    proj_params, other_params = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad: continue
-        if any(k in n for k in ["multi_modal_projector","mm_projector","vision_proj"]):
-            proj_params.append(p)
-        else:
-            other_params.append(p)
-    optim_groups = []
-    if other_params: optim_groups.append({"params": other_params, "lr": LR_LORA})
-    if proj_params:  optim_groups.append({"params": proj_params, "lr": LR_PROJ})
+        # Parameter groups (projector with different LR)
+        proj_params, other_params = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad: continue
+            if any(k in n for k in ["multi_modal_projector","mm_projector","vision_proj"]):
+                proj_params.append(p)
+            else:
+                other_params.append(p)
+        optim_groups = []
+        if other_params: optim_groups.append({"params": other_params, "lr": LR_LORA})
+        if proj_params:  optim_groups.append({"params": proj_params, "lr": LR_PROJ})
 
-    class MyTrainer(Trainer):
-        def create_optimizer(self):
-            if self.optimizer is None:
-                extra = {}
-                sig = inspect.signature(torch.optim.AdamW)
-                if "fused" in sig.parameters and torch.cuda.is_available() and "fused" in training_args.optim:
-                    extra["fused"] = True
-                self.optimizer = torch.optim.AdamW(
-                    optim_groups if optim_groups else self.model.parameters(),
-                    lr=training_args.learning_rate,
-                    betas=(0.9, 0.95), eps=1e-8, weight_decay=training_args.weight_decay,
-                    **extra
-                )
-            return self.optimizer
+        class MyTrainer(Trainer):
+            def create_optimizer(self):
+                if self.optimizer is None:
+                    extra = {}
+                    sig = inspect.signature(torch.optim.AdamW)
+                    if "fused" in sig.parameters and torch.cuda.is_available() and "fused" in optim_name:
+                        extra["fused"] = True
+                    self.optimizer = torch.optim.AdamW(
+                        optim_groups if optim_groups else self.model.parameters(),
+                        lr=training_args.learning_rate,
+                        betas=(0.9, 0.95), eps=1e-8, weight_decay=training_args.weight_decay,
+                        **extra
+                    )
+                return self.optimizer
 
-    trainer = MyTrainer(
-        model=model,
-        args=training_args,
-        data_collator=collator,
-        train_dataset=train_ds,
-        eval_dataset=(val_ds if do_eval else None),
-    )
+        trainer = MyTrainer(
+            model=model,
+            args=training_args,
+            data_collator=collator,
+            train_dataset=train_ds,
+            eval_dataset=(val_ds if do_eval else None),
+        )
 
-    print("CUDA:", torch.cuda.is_available(), "| Device:", device)
-    print("Dataset root:", dataset_root)
-    print("JSONL path  :", jsonl_path)
-    print("Run mode    :", run_mode)
-    print("Steps/epoch :", steps_per_epoch)
+        print("CUDA:", torch.cuda.is_available(), "| Device:", device)
+        print("Dataset root:", dataset_root)
+        print("JSONL path  :", jsonl_path)
+        print("Run mode    :", run_mode)
+        print("Steps/epoch :", steps_per_epoch)
 
-    # --------- Train or Eval-only ----------
-    latest = _latest_ckpt_dir(OUTDIR)
-
-    if EVAL_ONLY:
-        # Make sure adapters are loaded (again) from the latest checkpoint if there is one
-        if latest:
-            model = PeftModel.from_pretrained(model, latest)
-            print(f"[Eval-Only] Loaded adapters from {latest}")
-        else:
-            print("[Eval-Only] Using adapters from OUTDIR or base if none found.")
-    else:
+        # --------- Safe resume logic ----------
         print("Starting training...")
+        latest = _latest_ckpt_dir(OUTDIR)
         if latest:
             if version.parse(torch.__version__) < version.parse("2.6.0"):
                 _strip_state_files_for_torch_lt_26(latest)
@@ -643,20 +614,28 @@ def main():
         processor.save_pretrained(OUTDIR)
 
     # ---------- Evaluation ----------
-    # On GPU or when explicitly requested via EVAL_ONLY
-    if has_cuda or EVAL_ONLY:
+    if (has_cuda or device == "cpu") and do_eval:
         print("Evaluating on test split...")
-        model.eval()
+        try:
+            # Simple indicator; True if adapters are active
+            peft_active = isinstance(model, PeftModel) or hasattr(model, "peft_config")
+            print("PEFT active?", peft_active)
+        except Exception:
+            pass
 
-        # Small sanity: confirm PEFT is active
-        print("PEFT active?", any("lora" in n.lower() for n, _ in model.named_parameters()))
+        model.eval()
+        torch.set_grad_enabled(False)
 
         test_ds = PIIDataset(test_recs)
+        if EVAL_LIMIT > 0:
+            # Slice deterministic subset for quick checks
+            test_subset = test_ds.recs[:EVAL_LIMIT]
+            test_ds = PIIDataset(test_subset)
+
         y_true, y_pred = [], []
         gen_kwargs = dict(max_new_tokens=128, do_sample=False, pad_token_id=PAD_ID)
 
-        # Build and run
-        for idx, rec in enumerate(test_ds):
+        for i, rec in enumerate(test_ds):
             im = rec["image"]
             im = cap_long_side(im, LONG_SIDE_MAX)
             W, H = im.size
@@ -671,9 +650,7 @@ def main():
             with torch.no_grad():
                 out_ids = model.generate(**inputs, **gen_kwargs)
 
-            # Decode only the NEW tokens (exclude prompt)
-            gen_ids = out_ids[:, inputs["input_ids"].shape[1]:]
-            text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
+            text = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
             pred = parse_json_pred(text)
 
             _, truth_labels = normalize_labels({
@@ -683,11 +660,12 @@ def main():
             y_true.append(truth_labels)
             y_pred.append(pred)
 
-            if DEBUG_EVAL and idx < 10:
-                pos = [k for k,v in truth_labels.items() if v]
-                print(f"[{idx}] TEXT='{text[:300]}'")
-                print(f"     PRED_POS={[k for k,v in pred.items() if v]}")
-                print(f"     GT_POS={pos}")
+            if DEBUG_EVAL:
+                pred_pos = sorted([k for k, v in pred.items() if v])
+                gt_pos   = sorted([k for k, v in truth_labels.items() if v])
+                print(f"[{i}] TEXT={repr(text[:260] + ('...' if len(text)>260 else ''))}")
+                print(f"     PRED_POS={pred_pos}")
+                print(f"     GT_POS={gt_pos}")
 
         metrics = metrics_from_preds(y_true, y_pred)
         print("\n==== TEST METRICS ====")
