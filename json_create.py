@@ -3,8 +3,10 @@ from pathlib import Path
 
 
 # =========================
-ROOT_DIR = "C:\\Users\\yuval\\Desktop\\datasets\\pii"             # <- path to datasets
-OUT_JSONL = "C:\\Users\\yuval\\Desktop\\FinetuningJuly\\qwen\\pii_42k.jsonl"           # <- where to write the index
+# ROOT_DIR = "C:\\Users\\yuval\\Desktop\\datasets\\pii"             # <- path to datasets
+ROOT_DIR = "C:\\Users\\yuval\\Desktop\\datasets\\pii"
+# OUT_JSONL = "C:\\Users\\yuval\\Desktop\\FinetuningJuly\\qwen\\pii_42k.jsonl"           # <- where to write the index
+OUT_JSONL = "C:\\Users\\yuval\\Desktop\\FinetuningJuly\\pii_3k.jsonl"
 ABSOLUTE_PATHS = True                      # <- write absolute image paths?
 OVERRIDES_PATH = None                      # <- optional per-image overrides JSONL (or None)
 # =========================
